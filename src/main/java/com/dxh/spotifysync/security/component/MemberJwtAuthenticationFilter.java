@@ -44,8 +44,12 @@ public class MemberJwtAuthenticationFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         String path = request.getRequestURI();
-        // 只拦截 /member/** 请求
-        if (!path.startsWith("/member")) {
+        // 拦截 /member/** 和 /sync/spotify/*（除 callback 和 gallery）请求
+        boolean isMemberPath = path.startsWith("/member");
+        boolean isSyncPath = path.startsWith("/sync/spotify/")
+                && !path.startsWith("/sync/spotify/callback")
+                && !path.startsWith("/sync/spotify/gallery");
+        if (!isMemberPath && !isSyncPath) {
             chain.doFilter(request, response);
             return;
         }

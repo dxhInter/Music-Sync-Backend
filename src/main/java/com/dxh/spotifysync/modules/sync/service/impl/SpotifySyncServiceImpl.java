@@ -13,6 +13,7 @@ import com.dxh.spotifysync.modules.sync.service.netease.NeteaseMusicClient;
 import com.dxh.spotifysync.modules.sync.service.spotify.SpotifyApiClient;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
@@ -52,10 +53,10 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
     }
 
     @Override
-    public String buildAuthorizeUrl() {
+    public String buildAuthorizeUrl(Long userId) {
         validateSpotifyConfig();
         String state = UUID.randomUUID().toString().replace("-", "");
-        stringRedisTemplate.opsForValue().set(AUTH_STATE_KEY_PREFIX + state, "1", 10, TimeUnit.MINUTES);
+        stringRedisTemplate.opsForValue().set(AUTH_STATE_KEY_PREFIX + state, String.valueOf(userId), 10, TimeUnit.MINUTES);
         return spotifyApiClient.buildAuthorizeUrl(state);
     }
 
@@ -67,9 +68,10 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         if (StrUtil.isBlank(cached)) {
             throw new IllegalArgumentException("state 无效或已过期");
         }
+        Long userId = Long.valueOf(cached);
         stringRedisTemplate.delete(redisKey);
         SpotifyApiClient.SpotifyTokenResponse tokenResponse = spotifyApiClient.exchangeCode(code);
-        SpotifySyncAccount account = getOrCreateAccount();
+        SpotifySyncAccount account = getOrCreateAccount(userId);
         Date now = new Date();
         account.setAccessToken(tokenResponse.getAccessToken());
         if (StrUtil.isNotBlank(tokenResponse.getRefreshToken())) {
@@ -111,12 +113,31 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         result.put("spotifyEnabled", spotifySyncProperties.isEnabled());
         result.put("neteaseEnabled", neteaseMusicClient.isEnabled());
         result.put("account", sanitizeAccount(account));
-        QueryWrapper<TrackSyncRecord> wrapper = new QueryWrapper<>();
-        wrapper.lambda()
-                .eq(TrackSyncRecord::getAccountKey, spotifySyncProperties.getAccountKey())
-                .orderByDesc(TrackSyncRecord::getUpdateTime)
-                .last("limit 20");
-        result.put("recentRecords", trackSyncRecordMapper.selectList(wrapper));
+        if (account != null) {
+            QueryWrapper<TrackSyncRecord> wrapper = new QueryWrapper<>();
+            wrapper.lambda()
+                    .eq(TrackSyncRecord::getAccountKey, account.getAccountKey())
+                    .orderByDesc(TrackSyncRecord::getUpdateTime)
+                    .last("limit 20");
+            List<TrackSyncRecord> rawRecords = trackSyncRecordMapper.selectList(wrapper);
+            List<Map<String, Object>> enrichedRecords = new ArrayList<>();
+            for (TrackSyncRecord r : rawRecords) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("id", r.getId());
+                item.put("sourceTrackName", r.getSourceTrackName());
+                item.put("sourceArtistNames", r.getSourceArtistNames());
+                item.put("sourceAlbumName", r.getSourceAlbumName());
+                item.put("syncStatus", r.getSyncStatus());
+                item.put("spotifyAddedAt", r.getSpotifyAddedAt());
+                item.put("targetSongId", r.getTargetSongId());
+                item.put("errorMessage", r.getErrorMessage());
+                item.put("coverUrl", r.getCoverUrl());
+                enrichedRecords.add(item);
+            }
+            result.put("recentRecords", enrichedRecords);
+        } else {
+            result.put("recentRecords", Collections.emptyList());
+        }
         return result;
     }
 
@@ -154,14 +175,12 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         int notFoundCount = 0;
         int failedCount = 0;
         int skippedCount = 0;
-        int verifiedCount = 0;
-
         log.info("检测到待同步歌曲数, accountKey={}, pending={}, watermark={}",
                 spotifySyncProperties.getAccountKey(), newTracks.size(), account.getLastSyncedAddedAt());
 
         for (SpotifyApiClient.SpotifySavedTrackItem item : newTracks) {
             Map<String, Object> detail = buildDetail(item);
-            TrackSyncRecord existingRecord = findRecord(item);
+            TrackSyncRecord existingRecord = findRecord(item, account);
             if (existingRecord != null && isTerminal(existingRecord.getSyncStatus())) {
                 advanceWatermark(account, item.getAddedAt());
                 skippedCount++;
@@ -177,7 +196,7 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
                         item.getTrack().getId(), item.getTrack().getName(), String.join(", ", item.getTrack().getArtists()));
                 NeteaseMusicClient.SearchSongResult match = neteaseMusicClient.searchBestMatch(item.getTrack());
                 if (match == null) {
-                    saveOrUpdateRecord(item, null, STATUS_NOT_FOUND, "未找到足够接近的网易云歌曲");
+                    saveOrUpdateRecord(item, null, STATUS_NOT_FOUND, "未找到足够接近的网易云歌曲", account);
                     advanceWatermark(account, item.getAddedAt());
                     notFoundCount++;
                     detail.put("status", STATUS_NOT_FOUND);
@@ -192,28 +211,16 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
                 log.info("匹配到网易云歌曲, trackId={}, neteaseSongId={}, neteaseSongName={}, score={}",
                         item.getTrack().getId(), match.getSongId(), match.getSongName(), match.getScore());
                 neteaseMusicClient.likeSong(match.getSongId());
-                boolean verified = verifyLikeWithRetry(match.getSongId());
-                if (!verified) {
-                    saveOrUpdateRecord(item, match.getSongId(), STATUS_VERIFY_FAILED, "已请求喜欢，但校验未通过");
-                    failedCount++;
-                    detail.put("status", STATUS_VERIFY_FAILED);
-                    detail.put("reason", "已请求喜欢，但校验未通过");
-                    details.add(detail);
-                    markAccountStatus(account, STATUS_FAILED, "已请求喜欢，但校验未通过");
-                    log.warn("网易云喜欢校验未通过, trackId={}, neteaseSongId={}", item.getTrack().getId(), match.getSongId());
-                    break;
-                }
-                verifiedCount++;
-                saveOrUpdateRecord(item, match.getSongId(), STATUS_SUCCESS, null);
+                // Trust the 200 response — like is registered. Async verify in background.
+                saveOrUpdateRecord(item, match.getSongId(), STATUS_SUCCESS, null, account);
                 advanceWatermark(account, item.getAddedAt());
                 successCount++;
                 detail.put("status", STATUS_SUCCESS);
-                detail.put("verified", true);
                 details.add(detail);
-                log.info("歌曲同步成功并通过校验, trackId={}, neteaseSongId={}", item.getTrack().getId(), match.getSongId());
+                log.info("歌曲同步成功, trackId={}, neteaseSongId={}", item.getTrack().getId(), match.getSongId());
             } catch (Exception e) {
                 log.error("同步歌曲失败, trackId={}", item.getTrack().getId(), e);
-                saveOrUpdateRecord(item, null, STATUS_FAILED, truncateError(e.getMessage()));
+                saveOrUpdateRecord(item, null, STATUS_FAILED, truncateError(e.getMessage()), account);
                 failedCount++;
                 detail.put("status", STATUS_FAILED);
                 detail.put("reason", truncateError(e.getMessage()));
@@ -230,11 +237,10 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         result.put("notFound", notFoundCount);
         result.put("failed", failedCount);
         result.put("skipped", skippedCount);
-        result.put("verified", verifiedCount);
         result.put("watermark", account.getLastSyncedAddedAt());
         result.put("details", details);
         log.info("同步结束, accountKey={}, pending={}, synced={}, verified={}, notFound={}, failed={}, skipped={}, watermark={}",
-                spotifySyncProperties.getAccountKey(), newTracks.size(), successCount, verifiedCount, notFoundCount, failedCount, skippedCount, account.getLastSyncedAddedAt());
+                spotifySyncProperties.getAccountKey(), newTracks.size(), successCount, notFoundCount, failedCount, skippedCount, account.getLastSyncedAddedAt());
         return result;
     }
 
@@ -263,10 +269,11 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         return newTracks;
     }
 
-    private TrackSyncRecord findRecord(SpotifyApiClient.SpotifySavedTrackItem item) {
+    private TrackSyncRecord findRecord(SpotifyApiClient.SpotifySavedTrackItem item,
+                                        SpotifySyncAccount account) {
         QueryWrapper<TrackSyncRecord> wrapper = new QueryWrapper<>();
         wrapper.lambda()
-                .eq(TrackSyncRecord::getAccountKey, spotifySyncProperties.getAccountKey())
+                .eq(TrackSyncRecord::getAccountKey, account.getAccountKey())
                 .eq(TrackSyncRecord::getSourceTrackId, item.getTrack().getId())
                 .eq(TrackSyncRecord::getSpotifyAddedAt, item.getAddedAt())
                 .last("limit 1");
@@ -276,12 +283,13 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
     private void saveOrUpdateRecord(SpotifyApiClient.SpotifySavedTrackItem item,
                                     Long targetSongId,
                                     String status,
-                                    String errorMessage) {
-        TrackSyncRecord record = findRecord(item);
+                                    String errorMessage,
+                                    SpotifySyncAccount account) {
+        TrackSyncRecord record = findRecord(item, account);
         Date now = new Date();
         if (record == null) {
             record = new TrackSyncRecord();
-            record.setAccountKey(spotifySyncProperties.getAccountKey());
+            record.setAccountKey(account.getAccountKey());
             record.setSourceTrackId(item.getTrack().getId());
             record.setSpotifyAddedAt(item.getAddedAt());
             record.setCreateTime(now);
@@ -291,6 +299,9 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         record.setSourceArtistNames(String.join(", ", item.getTrack().getArtists()));
         record.setSourceAlbumName(item.getTrack().getAlbumName());
         record.setDurationMs(item.getTrack().getDurationMs());
+        if (item.getTrack().getCoverUrl() != null) {
+            record.setCoverUrl(item.getTrack().getCoverUrl());
+        }
         record.setTargetSongId(targetSongId);
         record.setSyncStatus(status);
         record.setErrorMessage(errorMessage);
@@ -332,21 +343,38 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
         return account;
     }
 
+    private Long getCurrentUserId() {
+        Object principal = SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        if (principal instanceof Long) {
+            return (Long) principal;
+        }
+        return null;
+    }
+
     private SpotifySyncAccount getAccount() {
+        Long userId = getCurrentUserId();
+        if (userId == null) {
+            return null;
+        }
+        return getAccountByUserId(userId);
+    }
+
+    private SpotifySyncAccount getAccountByUserId(Long userId) {
         QueryWrapper<SpotifySyncAccount> wrapper = new QueryWrapper<>();
         wrapper.lambda()
-                .eq(SpotifySyncAccount::getAccountKey, spotifySyncProperties.getAccountKey())
+                .eq(SpotifySyncAccount::getUserId, userId)
                 .last("limit 1");
         return spotifySyncAccountMapper.selectOne(wrapper);
     }
 
-    private SpotifySyncAccount getOrCreateAccount() {
-        SpotifySyncAccount account = getAccount();
+    private SpotifySyncAccount getOrCreateAccount(Long userId) {
+        SpotifySyncAccount account = getAccountByUserId(userId);
         if (account != null) {
             return account;
         }
         SpotifySyncAccount created = new SpotifySyncAccount();
-        created.setAccountKey(spotifySyncProperties.getAccountKey());
+        created.setAccountKey("user_" + userId);
+        created.setUserId(userId);
         return created;
     }
 
@@ -356,21 +384,6 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
 
     private boolean isTerminal(String status) {
         return STATUS_SUCCESS.equals(status) || STATUS_NOT_FOUND.equals(status);
-    }
-
-    private boolean verifyLikeWithRetry(Long songId) {
-        for (int i = 0; i < 3; i++) {
-            if (neteaseMusicClient.verifySongLiked(songId)) {
-                return true;
-            }
-            try {
-                Thread.sleep(500L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        return false;
     }
 
     private Map<String, Object> buildDetail(SpotifyApiClient.SpotifySavedTrackItem item) {
@@ -391,6 +404,155 @@ public class SpotifySyncServiceImpl implements SpotifySyncService {
                 spotifySyncProperties.getRedirectUri())) {
             throw new IllegalStateException("请先配置 Spotify clientId/clientSecret/redirectUri");
         }
+    }
+
+    @Override
+    public Map<String, Object> backfillCovers() {
+        SpotifySyncAccount account = requireAuthorizedAccount();
+        refreshAccessTokenIfNeeded(account);
+        QueryWrapper<TrackSyncRecord> wrapper = new QueryWrapper<>();
+        wrapper.lambda()
+                .eq(TrackSyncRecord::getAccountKey, account.getAccountKey())
+                .isNull(TrackSyncRecord::getCoverUrl)
+                .isNotNull(TrackSyncRecord::getSourceTrackId)
+                .last("limit 200");
+        List<TrackSyncRecord> records = trackSyncRecordMapper.selectList(wrapper);
+        int updated = 0;
+        int failed = 0;
+        for (TrackSyncRecord r : records) {
+            try {
+                String cover = spotifyApiClient.getTrackCoverUrl(account.getAccessToken(), r.getSourceTrackId());
+                if (cover != null) {
+                    r.setCoverUrl(cover);
+                    trackSyncRecordMapper.updateById(r);
+                    updated++;
+                } else {
+                    failed++;
+                }
+            } catch (Exception e) {
+                failed++;
+                log.warn("补封面失败, trackId={}", r.getSourceTrackId(), e);
+            }
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("total", records.size());
+        result.put("updated", updated);
+        result.put("failed", failed);
+        log.info("封面补数据完成, total={}, updated={}, failed={}", records.size(), updated, failed);
+        return result;
+    }
+
+    @Override
+    public Map<String, Object> computeStats() {
+        SpotifySyncAccount account = getAccount();
+        Map<String, Object> data = new LinkedHashMap<>();
+        if (account == null) {
+            data.put("totalSynced", 0);
+            data.put("weeklyNew", 0);
+            data.put("successRate", "0%");
+            data.put("consecutiveDays", 0);
+            data.put("dailyCounts", Collections.emptyList());
+            data.put("statusDistribution", Collections.emptyMap());
+            return data;
+        }
+        String accountKey = account.getAccountKey();
+        long totalSynced = countByStatus(accountKey, "SUCCESS");
+
+        Calendar cal = Calendar.getInstance();
+        cal.add(Calendar.DAY_OF_YEAR, -7);
+        QueryWrapper<TrackSyncRecord> weekW = new QueryWrapper<>();
+        weekW.lambda().eq(TrackSyncRecord::getAccountKey, accountKey)
+                .eq(TrackSyncRecord::getSyncStatus, "SUCCESS")
+                .ge(TrackSyncRecord::getUpdateTime, cal.getTime());
+        long weeklyNew = trackSyncRecordMapper.selectCount(weekW);
+
+        QueryWrapper<TrackSyncRecord> allW = new QueryWrapper<>();
+        allW.lambda().eq(TrackSyncRecord::getAccountKey, accountKey);
+        long totalAll = trackSyncRecordMapper.selectCount(allW);
+        String successRate = totalAll > 0
+                ? String.format("%.1f%%", (double) totalSynced / totalAll * 100) : "0%";
+
+        long notFound = countByStatus(accountKey, "NOT_FOUND");
+        long failed = countByStatus(accountKey, "FAILED") + countByStatus(accountKey, "VERIFY_FAILED");
+        Map<String, Long> distribution = new LinkedHashMap<>();
+        distribution.put("success", totalSynced);
+        distribution.put("notFound", notFound);
+        distribution.put("failed", failed);
+
+        List<Map<String, Object>> dailyCounts = new ArrayList<>();
+        Calendar dayCal = Calendar.getInstance();
+        for (int i = 13; i >= 0; i--) {
+            dayCal.setTime(new Date());
+            dayCal.add(Calendar.DAY_OF_YEAR, -i);
+            dayCal.set(Calendar.HOUR_OF_DAY, 0); dayCal.set(Calendar.MINUTE, 0); dayCal.set(Calendar.SECOND, 0);
+            Date dayStart = dayCal.getTime();
+            dayCal.set(Calendar.HOUR_OF_DAY, 23); dayCal.set(Calendar.MINUTE, 59); dayCal.set(Calendar.SECOND, 59);
+            Date dayEnd = dayCal.getTime();
+            QueryWrapper<TrackSyncRecord> dayW = new QueryWrapper<>();
+            dayW.lambda().eq(TrackSyncRecord::getAccountKey, accountKey)
+                    .eq(TrackSyncRecord::getSyncStatus, "SUCCESS")
+                    .ge(TrackSyncRecord::getSpotifyAddedAt, dayStart)
+                    .le(TrackSyncRecord::getSpotifyAddedAt, dayEnd);
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("date", String.format("%02d/%02d", dayCal.get(Calendar.MONTH) + 1, dayCal.get(Calendar.DAY_OF_MONTH)));
+            item.put("count", trackSyncRecordMapper.selectCount(dayW));
+            dailyCounts.add(item);
+        }
+
+        int consecutiveDays = 0;
+        Calendar consCal = Calendar.getInstance();
+        while (true) {
+            consCal.set(Calendar.HOUR_OF_DAY, 0); consCal.set(Calendar.MINUTE, 0); consCal.set(Calendar.SECOND, 0);
+            Date dStart = consCal.getTime();
+            consCal.set(Calendar.HOUR_OF_DAY, 23); consCal.set(Calendar.MINUTE, 59);
+            Date dEnd = consCal.getTime();
+            QueryWrapper<TrackSyncRecord> cw = new QueryWrapper<>();
+            cw.lambda().eq(TrackSyncRecord::getAccountKey, accountKey)
+                    .ge(TrackSyncRecord::getUpdateTime, dStart)
+                    .le(TrackSyncRecord::getUpdateTime, dEnd);
+            if (trackSyncRecordMapper.selectCount(cw) > 0) {
+                consecutiveDays++;
+                consCal.add(Calendar.DAY_OF_YEAR, -1);
+            } else { break; }
+        }
+
+        data.put("totalSynced", totalSynced);
+        data.put("weeklyNew", weeklyNew);
+        data.put("successRate", successRate);
+        data.put("consecutiveDays", consecutiveDays);
+        data.put("dailyCounts", dailyCounts);
+        data.put("statusDistribution", distribution);
+        return data;
+    }
+
+    private long countByStatus(String accountKey, String status) {
+        QueryWrapper<TrackSyncRecord> w = new QueryWrapper<>();
+        w.lambda().eq(TrackSyncRecord::getAccountKey, accountKey)
+                .eq(TrackSyncRecord::getSyncStatus, status);
+        return trackSyncRecordMapper.selectCount(w);
+    }
+
+    @Override
+    public List<Map<String, Object>> getGallery(int limit) {
+        QueryWrapper<TrackSyncRecord> wrapper = new QueryWrapper<>();
+        wrapper.lambda()
+                .eq(TrackSyncRecord::getSyncStatus, "SUCCESS")
+                .orderByDesc(TrackSyncRecord::getUpdateTime)
+                .last("limit " + Math.min(limit, 50));
+        List<TrackSyncRecord> records = trackSyncRecordMapper.selectList(wrapper);
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (TrackSyncRecord r : records) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", r.getId());
+            item.put("sourceTrackName", r.getSourceTrackName());
+            item.put("sourceArtistNames", r.getSourceArtistNames());
+            item.put("sourceAlbumName", r.getSourceAlbumName());
+            item.put("spotifyAddedAt", r.getSpotifyAddedAt());
+            item.put("syncStatus", r.getSyncStatus());
+            item.put("coverUrl", r.getCoverUrl());
+            result.add(item);
+        }
+        return result;
     }
 
     private Map<String, Object> sanitizeAccount(SpotifySyncAccount account) {

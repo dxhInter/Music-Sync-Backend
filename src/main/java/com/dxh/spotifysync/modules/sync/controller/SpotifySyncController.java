@@ -6,6 +6,7 @@ import com.dxh.spotifysync.modules.sync.service.netease.NeteaseMusicClient;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -34,8 +35,9 @@ public class SpotifySyncController {
     @ApiOperation("获取 Spotify 授权地址")
     @GetMapping("/authorize-url")
     public CommonResult<Map<String, String>> authorizeUrl() {
+        Long userId = (Long) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
         Map<String, String> data = new HashMap<>();
-        data.put("authorizeUrl", spotifySyncService.buildAuthorizeUrl());
+        data.put("authorizeUrl", spotifySyncService.buildAuthorizeUrl(userId));
         return CommonResult.success(data);
     }
 
@@ -56,6 +58,18 @@ public class SpotifySyncController {
     @GetMapping("/status")
     public CommonResult<Map<String, Object>> status() {
         return CommonResult.success(spotifySyncService.getStatus());
+    }
+
+    @ApiOperation("公开同步歌单展示墙")
+    @GetMapping("/gallery")
+    public CommonResult<List<Map<String, Object>>> gallery(@RequestParam(defaultValue = "20") int limit) {
+        return CommonResult.success(spotifySyncService.getGallery(limit));
+    }
+
+    @ApiOperation("补全历史歌曲的专辑封面")
+    @PostMapping("/backfill-covers")
+    public CommonResult<Map<String, Object>> backfillCovers() {
+        return CommonResult.success(spotifySyncService.backfillCovers());
     }
 
     @ApiOperation("检查网易云中转服务和登录状态")

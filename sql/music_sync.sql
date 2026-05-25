@@ -33,3 +33,10 @@ CREATE TABLE IF NOT EXISTS `music_sync_record` (
   UNIQUE KEY `uk_account_track_added` (`account_key`, `source_track_id`, `spotify_added_at`),
   KEY `idx_account_status_update_time` (`account_key`, `sync_status`, `update_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Migration: multi-user support
+ALTER TABLE `music_sync_account` ADD COLUMN `user_id` bigint DEFAULT NULL AFTER `id`;
+CREATE INDEX IF NOT EXISTS `idx_user_id` ON `music_sync_account` (`user_id`);
+
+-- Migration: album cover support
+ALTER TABLE `music_sync_record` ADD COLUMN `cover_url` varchar(1024) DEFAULT NULL AFTER `source_album_name`;

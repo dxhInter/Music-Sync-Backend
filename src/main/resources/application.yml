@@ -54,7 +54,8 @@ secure:
       - /admin/register
       - /member/login
       - /member/register
-      - /sync/**
+      - /sync/spotify/callback
+      - /sync/spotify/gallery
 
 music-sync:
   scheduler:

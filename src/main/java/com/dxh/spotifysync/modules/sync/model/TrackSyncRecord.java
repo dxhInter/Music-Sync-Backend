@@ -40,6 +40,9 @@ public class TrackSyncRecord implements Serializable {
     @ApiModelProperty("Spotify liked_at")
     private Date spotifyAddedAt;
 
+    @ApiModelProperty("专辑封面URL")
+    private String coverUrl;
+
     @ApiModelProperty("歌曲时长，单位毫秒")
     private Long durationMs;
 

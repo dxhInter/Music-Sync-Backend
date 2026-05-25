@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.*;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
@@ -21,12 +22,14 @@ import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
 
+@Slf4j
 @Component
 public class SpotifyApiClient {
 
     private static final String AUTHORIZE_URL = "https://accounts.spotify.com/authorize";
     private static final String TOKEN_URL = "https://accounts.spotify.com/api/token";
     private static final String SAVED_TRACKS_URL = "https://api.spotify.com/v1/me/tracks";
+    private static final String TRACK_URL = "https://api.spotify.com/v1/tracks/";
 
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
@@ -66,6 +69,27 @@ public class SpotifyApiClient {
         body.add("refresh_token", refreshToken);
         JsonNode jsonNode = postToken(body);
         return parseTokenResponse(jsonNode);
+    }
+
+    /**
+     * 获取单首歌曲的专辑封面 URL，不需要 scope 权限（仅需有效的 token）
+     */
+    public String getTrackCoverUrl(String accessToken, String trackId) {
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.setBearerAuth(accessToken);
+            HttpEntity<Void> requestEntity = new HttpEntity<>(headers);
+            ResponseEntity<String> response = restTemplate.exchange(
+                    TRACK_URL + trackId, HttpMethod.GET, requestEntity, String.class);
+            JsonNode root = objectMapper.readTree(response.getBody());
+            JsonNode images = root.path("album").path("images");
+            if (images.isArray() && images.size() > 0) {
+                return text(images.get(0), "url");
+            }
+        } catch (Exception e) {
+            log.warn("获取单曲封面失败, trackId={}", trackId, e);
+        }
+        return null;
     }
 
     public List<SpotifySavedTrackItem> getSavedTracks(String accessToken, int limit) {
@@ -118,12 +142,19 @@ public class SpotifyApiClient {
                 while (artistIterator.hasNext()) {
                     artists.add(text(artistIterator.next(), "name"));
                 }
+                // Extract album cover image (first image from album.images array)
+                String coverUrl = null;
+                JsonNode images = trackNode.path("album").path("images");
+                if (images.isArray() && images.size() > 0) {
+                    coverUrl = text(images.get(0), "url");
+                }
                 SpotifyTrack track = new SpotifyTrack(
                         text(trackNode, "id"),
                         text(trackNode, "name"),
                         text(trackNode.path("album"), "name"),
                         artists,
-                        trackNode.path("duration_ms").asLong(0L)
+                        trackNode.path("duration_ms").asLong(0L),
+                        coverUrl
                 );
                 Date addedAt = Date.from(Instant.parse(text(itemNode, "added_at")));
                 result.add(new SpotifySavedTrackItem(addedAt, track));
@@ -168,5 +199,6 @@ public class SpotifyApiClient {
         private String albumName;
         private List<String> artists;
         private long durationMs;
+        private String coverUrl;
     }
 }

@@ -22,6 +22,9 @@ public class SpotifySyncAccount implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @ApiModelProperty("关联用户ID")
+    private Long userId;
+
     @ApiModelProperty("账户标识")
     private String accountKey;
 
